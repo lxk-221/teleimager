@@ -59,7 +59,7 @@ def main():
     # command line args
     import argparse
     parser = argparse.ArgumentParser()
-    parser.add_argument('--host', type=str, default='192.168.123.164', help='IP address of image server')
+    parser.add_argument('--host', type=str, default='192.168.123.167', help='IP address of image server')
     args = parser.parse_args()
 
     # Example usage with three camera streams
