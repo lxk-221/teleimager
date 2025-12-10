@@ -557,12 +557,18 @@ class OpenCVCamera(BaseCamera):
         self.cap.set(cv2.CAP_PROP_FRAME_WIDTH,  self._img_shape[1])
         self.cap.set(cv2.CAP_PROP_FPS, self._fps)
 
-        # Test if the camera can read frames
+        # Test if the camera can read frames BEFORE starting the reader thread
         if not self._can_read_frame():
-            self.release()
+            self.cap.release()
+            self.cap = None
             raise RuntimeError(f"[OpenCVCamera] Camera {self._cam_topic} failed to initialize or read frames.")
-        else:
-            logger_mp.info(str(self))
+        
+        # Start the frame reader thread
+        self._current_frame = None
+        self._frame_lock = threading.Lock()
+        self._frame_reader_stop = threading.Event()
+        self._frame_reader_thread = threading.Thread(target=self._frame_reader_loop, daemon=True)
+        self._frame_reader_thread.start()
 
     def __str__(self):
         return (
@@ -575,27 +581,48 @@ class OpenCVCamera(BaseCamera):
     def _can_read_frame(self):
         success, _ = self.cap.read()
         return success
+
+    def _frame_reader_loop(self):
+        while not self._frame_reader_stop.is_set():
+            if self.cap is not None:
+                ret, bgr_numpy = self.cap.read()
+                if ret and bgr_numpy is not None:
+                    with self._frame_lock:
+                        self._current_frame = bgr_numpy.copy()
+                else:
+                    time.sleep(0.01)
+            else:
+                break
+            time.sleep(0.001)
     
     def _update_frame(self):
-        if self.cap is not None:
-            ret, bgr_numpy = self.cap.read()
-            if ret:
-                if self._enable_webrtc:
-                    self._webrtc_buffer.write(bgr_numpy)
-
-                if self.enable_zmq:
-                    ok, buf = cv2.imencode(".jpg", bgr_numpy)
-                    if ok:
-                        self._zmq_buffer.write(buf.tobytes())
-                
-                if not self._ready.is_set():
-                    self._ready.set()
-            else:
-                raise RuntimeError
+        """Use the latest frame from the continuous reader thread."""
+        with self._frame_lock:
+            bgr_numpy = self._current_frame
+        
+        if bgr_numpy is not None:
+            if self._enable_webrtc:
+                self._webrtc_buffer.write(bgr_numpy)
+            if self.enable_zmq:
+                ok, buf = cv2.imencode(".jpg", bgr_numpy)
+                if ok:
+                    self._zmq_buffer.write(buf.tobytes())
+            if not self._ready.is_set():
+                self._ready.set()
+        else:
+            # No frame available yet, wait a bit
+            time.sleep(0.01)
 
     def release(self):
-        self.cap.release()
-        self.cap = None
+        self._frame_reader_stop.set()
+        if self._frame_reader_thread.is_alive():
+            self._frame_reader_thread.join(timeout=1.0)
+        
+        # Release the capture
+        if self.cap is not None:
+            self.cap.release()
+            self.cap = None
+        
         logger_mp.info(f"[OpenCVCamera] Released {self._cam_topic}")
 
 # ========================================================
