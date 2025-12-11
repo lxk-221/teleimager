@@ -23,17 +23,18 @@ class ImageClient:
         if self._cam_config is None:
             raise RuntimeError("Failed to get camera configuration.")
         
-        if self._cam_config['head_camera']['enable_zmq']:
-            self._subscriber_manager.subscribe(self._host, self._cam_config['head_camera']['zmq_port'])
+        if "head_camera" in self._cam_config:
+            if self._cam_config['head_camera']['enable_zmq']:
+                self._subscriber_manager.subscribe(self._host, self._cam_config['head_camera']['zmq_port'])
+            if not self._cam_config['head_camera']['enable_zmq'] and not self._cam_config['head_camera']['enable_webrtc']:
+                logger_mp.warning("[Image Client] NOTICE! Head camera is not enabled on both ZMQ and WebRTC.")
+        if "left_wrist_camera" in self._cam_config:
+            if self._cam_config['left_wrist_camera']['enable_zmq']:
+                self._subscriber_manager.subscribe(self._host, self._cam_config['left_wrist_camera']['zmq_port'])
+        if "right_wrist_camera" in self._cam_config:
+            if self._cam_config['right_wrist_camera']['enable_zmq']:
+                self._subscriber_manager.subscribe(self._host, self._cam_config['right_wrist_camera']['zmq_port'])
 
-        if self._cam_config['left_wrist_camera']['enable_zmq']:
-            self._subscriber_manager.subscribe(self._host, self._cam_config['left_wrist_camera']['zmq_port'])
-
-        if self._cam_config['right_wrist_camera']['enable_zmq']:
-            self._subscriber_manager.subscribe(self._host, self._cam_config['right_wrist_camera']['zmq_port'])
-
-        if not self._cam_config['head_camera']['enable_zmq'] and not self._cam_config['head_camera']['enable_webrtc']:
-            logger_mp.warning("[Image Client] NOTICE! Head camera is not enabled on both ZMQ and WebRTC.")
 
     # --------------------------------------------------------
     # public api
@@ -58,7 +59,7 @@ def main():
     # command line args
     import argparse
     parser = argparse.ArgumentParser()
-    parser.add_argument('--host', type=str, default='192.168.123.164', help='IP address of image server')
+    parser.add_argument('--host', type=str, default='192.168.123.167', help='IP address of image server')
     args = parser.parse_args()
 
     # Example usage with three camera streams
@@ -67,27 +68,31 @@ def main():
 
     running = True
     while running:
-        if cam_config['head_camera']['enable_zmq']:
-            head_img, head_fps = client.get_head_frame()
-            if head_img is not None:
-                logger_mp.info(f"Head Camera FPS: {head_fps:.2f}")
-                logger_mp.debug(f"Head Camera Shape: {cam_config['head_camera']['image_shape']}")
-                logger_mp.debug(f"Head Camera Binocular: {cam_config['head_camera']['binocular']}")
-                cv2.imshow("Head Camera", head_img)
+        if "head_camera" in cam_config:
+            if cam_config['head_camera']['enable_zmq']:
+                head_img, head_fps = client.get_head_frame()
+                if head_img is not None:
+                    logger_mp.info(f"head_img shape: {head_img.shape}")
+                    logger_mp.info(f"Head Camera FPS: {head_fps:.2f}")
+                    logger_mp.info(f"Head Camera Shape: {cam_config['head_camera']['image_shape']}")
+                    logger_mp.debug(f"Head Camera Binocular: {cam_config['head_camera']['binocular']}")
+                    cv2.imshow("Head Camera", head_img)
 
-        if cam_config['left_wrist_camera']['enable_zmq']:
-            left_wrist_img, left_wrist_fps = client.get_left_wrist_frame()
-            if left_wrist_img is not None:
-                logger_mp.info(f"Left Wrist Camera FPS: {left_wrist_fps:.2f}")
-                logger_mp.debug(f"Left Wrist Camera Shape: {cam_config['left_wrist_camera']['image_shape']}")
-                cv2.imshow("Left Wrist Camera", left_wrist_img)
+        if "left_wrist_camera" in cam_config:
+            if cam_config['left_wrist_camera']['enable_zmq']:
+                left_wrist_img, left_wrist_fps = client.get_left_wrist_frame()
+                if left_wrist_img is not None:
+                    logger_mp.info(f"Left Wrist Camera FPS: {left_wrist_fps:.2f}")
+                    logger_mp.debug(f"Left Wrist Camera Shape: {cam_config['left_wrist_camera']['image_shape']}")
+                    cv2.imshow("Left Wrist Camera", left_wrist_img)
 
-        if cam_config['right_wrist_camera']['enable_zmq']:
-            right_wrist_img, right_wrist_fps = client.get_right_wrist_frame()
-            if right_wrist_img is not None:
-                logger_mp.info(f"Right Wrist Camera FPS: {right_wrist_fps:.2f}")
-                logger_mp.debug(f"Right Wrist Camera Shape: {cam_config['right_wrist_camera']['image_shape']}")
-                cv2.imshow("Right Wrist Camera", right_wrist_img)
+        if "right_wrist_camera" in cam_config:
+            if cam_config['right_wrist_camera']['enable_zmq']:
+                right_wrist_img, right_wrist_fps = client.get_right_wrist_frame()
+                if right_wrist_img is not None:
+                    logger_mp.info(f"Right Wrist Camera FPS: {right_wrist_fps:.2f}")
+                    logger_mp.debug(f"Right Wrist Camera Shape: {cam_config['right_wrist_camera']['image_shape']}")
+                    cv2.imshow("Right Wrist Camera", right_wrist_img)
 
         if cv2.waitKey(1) & 0xFF == ord('q'):
             logger_mp.info("Exiting image client on user request.")
