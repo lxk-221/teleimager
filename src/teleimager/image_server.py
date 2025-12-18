@@ -14,6 +14,7 @@ import functools
 import subprocess
 import platform
 import logging_mp
+import pyzed.sl as sl
 logging_mp.basic_config(level=logging_mp.INFO)
 logger_mp = logging_mp.get_logger(__name__)
 
@@ -367,6 +368,11 @@ class BaseCamera:
            Before call this function, must first call get_frame() to update the latest depth data."""
         return None
 
+    def get_point_cloud(self):
+        """Return a point cloud as bytes, or None if not supported.
+           Before call this function, must first call get_frame() to update the latest point cloud data."""
+        return None
+
     def get_zmq_port(self):
         """Return the zmq port number the camera is serving on."""
         return self._zmq_port
@@ -557,6 +563,9 @@ class OpenCVCamera(BaseCamera):
         self.cap.set(cv2.CAP_PROP_FRAME_WIDTH,  self._img_shape[1])
         self.cap.set(cv2.CAP_PROP_FPS, self._fps)
 
+        self.cap.set(cv2.CAP_PROP_BRIGHTNESS, 5)  # 0-8, default=4
+        self.cap.set(cv2.CAP_PROP_GAIN, 5)        # 0-8, default=4
+
         # Test if the camera can read frames BEFORE starting the reader thread
         if not self._can_read_frame():
             self.cap.release()
@@ -605,6 +614,8 @@ class OpenCVCamera(BaseCamera):
                 self._webrtc_buffer.write(bgr_numpy)
             if self.enable_zmq:
                 ok, buf = cv2.imencode(".jpg", bgr_numpy)
+                #cv2.imshow("OpenCVCamera", bgr_numpy)
+                #cv2.waitKey(1)
                 if ok:
                     self._zmq_buffer.write(buf.tobytes())
             if not self._ready.is_set():
@@ -625,6 +636,205 @@ class OpenCVCamera(BaseCamera):
         
         logger_mp.info(f"[OpenCVCamera] Released {self._cam_topic}")
 
+class ZedCamera(BaseCamera):
+    def __init__(self, cam_topic, serial_number, img_shape, fps, 
+                 enable_zmq=True, zmq_port=55555, enable_webrtc=False, webrtc_port=66666, 
+                 enable_depth=False, enable_point_cloud=False,
+                 depth_port=None, pointcloud_port=None):
+        super().__init__(cam_topic, img_shape, fps, enable_zmq, zmq_port, enable_webrtc, webrtc_port)
+        self._serial_number = serial_number
+        self._enable_depth = enable_depth
+        self._enable_point_cloud = enable_point_cloud
+        self._latest_depth = None
+        self._latest_point_cloud = None
+        
+        # 深度图和点云的ZMQ端口
+        self._depth_port = depth_port
+        self._pointcloud_port = pointcloud_port
+        # 为深度图和点云创建独立的buffer
+        if self._enable_depth and self._depth_port:
+            self._depth_buffer = zmq_msg.TripleRingBuffer()
+        else:
+            self._depth_buffer = None
+        if self._enable_point_cloud and self._pointcloud_port:
+            self._pointcloud_buffer = zmq_msg.TripleRingBuffer()
+        else:
+            self._pointcloud_buffer = None
+
+        # 初始化ZED相机
+        self.zed = sl.Camera()
+        init_params = sl.InitParameters()
+        
+        # 根据请求的分辨率设置
+        # 注意：ZED双目相机，image_shape可能是拼接后的尺寸（宽度×2）
+        # 需要判断单目分辨率来设置camera_resolution
+        single_width = img_shape[1] // 2  # 拼接模式下单目宽度
+        
+        if img_shape[0] == 1080 and single_width == 1920:
+            init_params.camera_resolution = sl.RESOLUTION.HD1080
+        elif img_shape[0] == 720 and single_width == 1280:
+            init_params.camera_resolution = sl.RESOLUTION.HD720
+        elif img_shape[0] == 1080 and img_shape[1] == 1920:  # 未拼接的HD1080
+            init_params.camera_resolution = sl.RESOLUTION.HD1080
+        elif img_shape[0] == 720 and img_shape[1] == 1280:   # 未拼接的HD720
+            init_params.camera_resolution = sl.RESOLUTION.HD720
+        else:
+            init_params.camera_resolution = sl.RESOLUTION.HD720
+            logger_mp.warning(f"[ZedCamera] Unsupported resolution {img_shape}, using HD720 (1280x720)")
+        
+        init_params.camera_fps = fps
+        init_params.depth_mode = sl.DEPTH_MODE.PERFORMANCE if (enable_depth or enable_point_cloud) else sl.DEPTH_MODE.NONE
+        init_params.coordinate_units = sl.UNIT.METER
+        
+        # 如果指定了serial_number，设置它
+        # 注意：serial_number必须是有效的数字，不能是 "unknown" 或 None
+        if serial_number and str(serial_number).lower() not in ['none', 'null', 'unknown', '']:
+            try:
+                init_params.set_from_serial_number(int(serial_number))
+                logger_mp.info(f"[ZedCamera] Using serial number: {serial_number}")
+            except (ValueError, TypeError) as e:
+                logger_mp.warning(f"[ZedCamera] Invalid serial number '{serial_number}', will use first available camera: {e}")
+        
+        err = self.zed.open(init_params)
+        if err != sl.ERROR_CODE.SUCCESS:
+            raise RuntimeError(f"[ZedCamera] Failed to open camera {self._cam_topic}: {err}")
+
+        # 设置相机参数：亮度和对比度
+        self.zed.set_camera_settings(sl.VIDEO_SETTINGS.BRIGHTNESS, 5)
+        self.zed.set_camera_settings(sl.VIDEO_SETTINGS.CONTRAST, 5)
+        logger_mp.info(f"[ZedCamera] Camera settings: Brightness=5, Contrast=5")
+
+        # 创建运行时参数
+        self.runtime_params = sl.RuntimeParameters()
+        
+        logger_mp.info(str(self))
+
+    def __str__(self):
+        return (
+            f"[ZedCamera: {self._cam_topic}] initialized with "
+            f"{self._img_shape[0]}x{self._img_shape[1]} @ {self._fps} FPS.\n"
+            f"ZMQ: {'enabled, zmq_port=' + str(self._zmq_port) if self.enable_zmq() else 'disabled'}; "
+            f"WebRTC: {'enabled, webrtc_port=' + str(self._webrtc_port) if self._enable_webrtc else 'disabled'}; "
+            f"Depth: {'enabled, depth_port=' + str(self._depth_port) if self._enable_depth else 'disabled'}; "
+            f"PointCloud: {'enabled, pc_port=' + str(self._pointcloud_port) if self._enable_point_cloud else 'disabled'}; "
+        )
+    
+    def _update_frame(self):
+        """采集图像、深度图和点云数据"""
+        if self.zed is None:
+            return
+        
+        # 采集新帧
+        start_time = time.time()
+        logger_mp.info(f"[ZedCamera] Grabbing new frame")
+        err = self.zed.grab(self.runtime_params)
+        if err != sl.ERROR_CODE.SUCCESS:
+            return
+    
+        left_image = sl.Mat()
+        right_image = sl.Mat()
+        self.zed.retrieve_image(left_image, sl.VIEW.LEFT)
+        self.zed.retrieve_image(right_image, sl.VIEW.RIGHT)
+        
+        # ZED SDK retrieve_image()可能返回BGRA（4通道）或BGR（3通道），取决于SDK版本和配置
+        left_data = left_image.get_data()
+        right_data = right_image.get_data()
+        
+        # 检查并转换为BGR格式（如果需要）
+        if left_data.shape[2] == 4:  # BGRA格式
+            left_bgr = cv2.cvtColor(left_data, cv2.COLOR_BGRA2BGR)
+            right_bgr = cv2.cvtColor(right_data, cv2.COLOR_BGRA2BGR)
+        else:  # 已经是BGR格式
+            left_bgr = left_data
+            right_bgr = right_data
+        
+        # 水平拼接左右图像（BGR格式，3通道）
+        bgr_numpy = np.hstack([left_bgr, right_bgr])
+        
+        # 获取深度图
+        if self._enable_depth:
+            depth = sl.Mat()
+            self.zed.retrieve_measure(depth, sl.MEASURE.DEPTH)
+            depth_numpy = depth.get_data()
+            
+            self._latest_depth = depth_numpy
+            
+            # 将深度图写入buffer (序列化为bytes)
+            if self._depth_buffer:
+                self._depth_buffer.write(depth_numpy.tobytes())
+        
+        # 获取点云
+        if self._enable_point_cloud:
+            point_cloud = sl.Mat()
+            self.zed.retrieve_measure(point_cloud, sl.MEASURE.XYZRGBA)
+            point_cloud_numpy = point_cloud.get_data()  # Shape: (H, W, 4)
+            
+            # 注意：点云不应该resize！保持原始分辨率以保持3D坐标准确性
+            # point_cloud_numpy[:,:,0:3] = XYZ坐标（米）
+            # point_cloud_numpy[:,:,3] = RGBA颜色（打包的float32）
+            self._latest_point_cloud = point_cloud_numpy
+            
+            # 将点云写入buffer (序列化为bytes)
+            # 传输格式: (H, W, 4) 的 float32 数组
+            if self._pointcloud_buffer:
+                self._pointcloud_buffer.write(point_cloud_numpy.tobytes())
+        
+        # 更新RGB缓冲区
+        if self._enable_webrtc:
+            self._webrtc_buffer.write(bgr_numpy)
+        
+        end_time = time.time()
+        logger_mp.info(f"[ZedCamera] Time taken to update frame: {end_time - start_time} seconds, fps: {1.0 / (end_time - start_time)}")
+
+        if self.enable_zmq():
+            ok, buf = cv2.imencode(".jpg", bgr_numpy)
+            if ok:
+                self._zmq_buffer.write(buf.tobytes())
+        
+        if not self._ready.is_set():
+            self._ready.set()
+
+    def get_depth_frame(self):
+        """返回深度图数据 (用于非ZMQ场景)"""
+        if self._latest_depth is None:
+            return None
+        return self._latest_depth.tobytes()
+    
+    def get_point_cloud(self):
+        """返回点云数据 (用于非ZMQ场景)"""
+        if self._latest_point_cloud is None:
+            return None
+        return self._latest_point_cloud.tobytes()
+    
+    def get_depth_bytes(self):
+        """从buffer获取深度图bytes (用于ZMQ传输)"""
+        if self._depth_buffer is None:
+            return None
+        return self._depth_buffer.read()
+    
+    def get_pointcloud_bytes(self):
+        """从buffer获取点云bytes (用于ZMQ传输)"""
+        if self._pointcloud_buffer is None:
+            return None
+        return self._pointcloud_buffer.read()
+    
+    def get_depth_port(self):
+        """返回深度图ZMQ端口"""
+        return self._depth_port
+    
+    def get_pointcloud_port(self):
+        """返回点云ZMQ端口"""
+        return self._pointcloud_port
+
+    def release(self):
+        if self.zed is not None:
+            try:
+                self.zed.close()
+            except Exception as e:
+                logger_mp.warning(f"[ZedCamera] Failed to close: {e}")
+            self.zed = None
+        
+        logger_mp.info(f"[ZedCamera] Released {self._cam_topic}")
 # ========================================================
 # image server
 # ========================================================
@@ -700,6 +910,22 @@ class ImageServer:
                         self._cameras[cam_topic] = RealSenseCamera(cam_topic, serial_number, img_shape, fps,
                                                                    enable_zmq, zmq_port, enable_webrtc, webrtc_port)
 
+                elif cam_type == "zed":
+                    enable_depth = cam_cfg.get("enable_depth", False)
+                    enable_point_cloud = cam_cfg.get("enable_point_cloud", False)
+                    depth_port = cam_cfg.get("depth_port", None)
+                    pointcloud_port = cam_cfg.get("pointcloud_port", None)
+                    try:
+                        self._cameras[cam_topic] = ZedCamera(
+                            cam_topic, serial_number, img_shape, fps,
+                            enable_zmq, zmq_port, enable_webrtc, webrtc_port,
+                            enable_depth, enable_point_cloud,
+                            depth_port, pointcloud_port
+                        )
+                    except Exception as e:
+                        self._cameras[cam_topic] = None
+                        logger_mp.error(f"[Image Server] Failed to initialize ZedCamera for {cam_topic}: {e}")
+
                 elif cam_type == "uvc":
                     uid = None
                     if physical_path is not None:
@@ -773,6 +999,7 @@ class ImageServer:
             next_frame_time = time.monotonic()
 
             while not self._stop_event.is_set():
+                # 发布RGB图像
                 jpeg_bytes = camera.get_jpeg_bytes()
                 if jpeg_bytes is not None:
                     self._zmq_publisher_manager.publish(jpeg_bytes, camera.get_zmq_port())
@@ -780,6 +1007,20 @@ class ImageServer:
                     logger_mp.warning(f"[Image Server] {cam_topic} returned no frame.")
                     self._stop_event.set()
                     break
+                
+                # 如果是ZedCamera，同时发布深度图和点云（同一帧数据）
+                if isinstance(camera, ZedCamera):
+                    # 发布深度图
+                    if hasattr(camera, 'get_depth_port') and camera.get_depth_port():
+                        depth_bytes = camera.get_depth_bytes()
+                        if depth_bytes is not None:
+                            self._zmq_publisher_manager.publish(depth_bytes, camera.get_depth_port())
+                    
+                    # 发布点云
+                    if hasattr(camera, 'get_pointcloud_port') and camera.get_pointcloud_port():
+                        pc_bytes = camera.get_pointcloud_bytes()
+                        if pc_bytes is not None:
+                            self._zmq_publisher_manager.publish(pc_bytes, camera.get_pointcloud_port())
 
                 next_frame_time += interval
                 sleep_time = next_frame_time - time.monotonic()
@@ -788,7 +1029,7 @@ class ImageServer:
                 else:
                     next_frame_time = time.monotonic()
         except Exception as e:
-            logger_mp.error(f"[Image Server] Failed to publish zmq frame from {cam_topic} camera.")
+            logger_mp.error(f"[Image Server] Failed to publish zmq data from {cam_topic} camera: {e}")
             self._stop_event.set()
     
     def _webrtc_pub(self, cam_topic: str, camera: BaseCamera):
@@ -871,6 +1112,15 @@ class ImageServer:
                 t = threading.Thread(target=self._zmq_pub, args=(camera_topic, camera), daemon=True)
                 t.start()
                 self._publisher_threads.append(t)
+                
+                # 日志记录ZedCamera的额外端口
+                if isinstance(camera, ZedCamera):
+                    ports_info = f"RGB port={camera.get_zmq_port()}"
+                    if hasattr(camera, 'get_depth_port') and camera.get_depth_port():
+                        ports_info += f", Depth port={camera.get_depth_port()}"
+                    if hasattr(camera, 'get_pointcloud_port') and camera.get_pointcloud_port():
+                        ports_info += f", PointCloud port={camera.get_pointcloud_port()}"
+                    logger_mp.info(f"[Image Server] Started ZMQ publisher for {camera_topic} ({ports_info})")
 
     def wait(self):
         self._stop_event.wait()

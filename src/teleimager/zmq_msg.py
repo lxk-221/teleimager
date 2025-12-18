@@ -249,7 +249,7 @@ class PublisherManager:
 class SubscriberThread(threading.Thread):
     """Thread that owns a SUB socket and handles receiving the latest message."""
 
-    def __init__(self, host: str, port: int, context: Optional[zmq.Context] = None):
+    def __init__(self, host: str, port: int, context: Optional[zmq.Context] = None, decode_jpeg: bool = True):
         """Initialize subscriber thread.
 
         Args:
@@ -269,6 +269,7 @@ class SubscriberThread(threading.Thread):
         self._t0 = None
         self._fps_count = 0
         self._fps_interval = 8  # update fps every 8 frames
+        self._decode_jpeg = decode_jpeg
 
     def _decode_image(self, jpg_bytes):
         """Decode JPEG bytes to OpenCV image."""
@@ -341,7 +342,10 @@ class SubscriberThread(threading.Thread):
                     try:
                         # receive the latest message
                         img_bytes = self._socket.recv()
-                        img_numpy = self._decode_image(img_bytes)  # decode JPEG bytes to bgr image
+                        if self._decode_jpeg:
+                            img_numpy = self._decode_image(img_bytes)  # decode JPEG bytes to bgr image
+                        else:
+                            img_numpy = img_bytes
                         self._update_fps()                         # update fps
                         self._triple_ring_buffer.write(img_numpy)  # write to 3-ring-buffer
                     except Exception as e:
@@ -361,8 +365,6 @@ class SubscriberThread(threading.Thread):
                 except Exception as e:
                     logger_mp.warning(f"Error closing socket in cleanup: {e}")
                 self._socket = None
-
-
 class SubscriberManager:
     """Centralized management of ZMQ subscribers."""
 
@@ -374,9 +376,9 @@ class SubscriberManager:
     def __init__(self):
         self._context = zmq.Context()
 
-    def _create_subscriber_thread(self, host: str, port: int) -> SubscriberThread:
+    def _create_subscriber_thread(self, host: str, port: int, decode_jpeg: bool = True) -> SubscriberThread:
         try:
-            subscriber_thread = SubscriberThread(host, port, self._context)
+            subscriber_thread = SubscriberThread(host, port, self._context, decode_jpeg)
             subscriber_thread.start()
             # Wait for the thread to start and socket to be ready
             if not subscriber_thread._wait_for_start(timeout=1.0):
@@ -386,11 +388,11 @@ class SubscriberManager:
             logger_mp.error(f"Failed to create subscriber thread for {host}:{port}: {e}")
             raise 
 
-    def _get_subscriber_thread(self, host: str, port: int) -> SubscriberThread:
+    def _get_subscriber_thread(self, host: str, port: int, decode_jpeg: bool = True) -> SubscriberThread:
         key = (host, port)
         with self._lock:
             if key not in self._subscriber_threads:
-                self._subscriber_threads[key] = self._create_subscriber_thread(host, port)
+                self._subscriber_threads[key] = self._create_subscriber_thread(host, port, decode_jpeg)
             return self._subscriber_threads[key]
         
     # --------------------------------------------------------
@@ -405,20 +407,21 @@ class SubscriberManager:
                     cls._instance = cls()
         return cls._instance
 
-    def subscribe(self, host: str, port: int) -> Tuple[Optional[np.ndarray], float]:
+    def subscribe(self, host: str, port: int, decode_jpeg: bool = True) -> Tuple[Optional[np.ndarray], float]:
         """Receive the latest message from the specified subscriber.
         Args:
             host: The server address
             port: The port number
+            decode_jpeg: If True, decode JPEG bytes to BGR image. If False, return raw bytes.
 
         Returns:
-            img: The latest message as an BGR OpenCV image, or None if no message has been received.
+            data: The latest message as BGR OpenCV image (if decode_jpeg=True) or raw bytes (if decode_jpeg=False)
             fps: The current receiving frame per second (FPS).
         """
         if not self._running:
             raise RuntimeError("SubscriberManager is closed.")
 
-        subscriber_thread = self._get_subscriber_thread(host, port)
+        subscriber_thread = self._get_subscriber_thread(host, port, decode_jpeg)
         return subscriber_thread.recv(), subscriber_thread.get_fps()
 
     def close(self) -> None:
