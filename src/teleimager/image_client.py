@@ -160,10 +160,12 @@ def main():
                     # 显示深度图
                     if head_depth_bytes is not None:
                         # 转换bytes为numpy数组
+                        head_depth = np.frombuffer(head_depth_bytes, dtype=np.float32)
+                        #logger_mp.info(f"head_depth shape: {head_depth.shape}")
                         h = cam_config['head_camera']['image_shape'][0]
                         w = cam_config['head_camera']['image_shape'][1] // 2  # 左图宽度
-                        head_depth = np.frombuffer(head_depth_bytes, dtype=np.float32).reshape(h, w)
-                        
+                        head_depth = head_depth.reshape(h, w)
+                        logger_mp.info(f"head_depth reshape shaped shape: {head_depth.shape}")
                         # 可视化深度图
                         depth_vis = np.nan_to_num(head_depth, nan=10.0)
                         depth_vis = np.clip(depth_vis, 0, 10.0)
@@ -173,7 +175,11 @@ def main():
                         cv2.imwrite(os.path.join(save_dir, f"depth_frame_{frame_counter:06d}.jpg"), depth_colormap)
                     
                     if head_pointcloud_bytes is not None:
-                        np.save(os.path.join(save_dir, f"pointcloud_frame_{frame_counter:06d}.npy"), head_pointcloud_bytes)
+                        pointcloud = np.frombuffer(head_pointcloud_bytes, dtype=np.float32)
+                        #logger_mp.info(f"pointcloud shape: {pointcloud.shape}")
+                        pointcloud = pointcloud.reshape(cam_config['head_camera']['image_shape'][0], cam_config['head_camera']['image_shape'][1]//2, 4)
+                        #logger_mp.info(f"pointcloud reshape shape: {pointcloud.shape}")
+                        np.save(os.path.join(save_dir, f"pointcloud_frame_{frame_counter:06d}.npy"), pointcloud)
 
                     end_time = time.time()
                     logger_mp.info(f"Head Camera Save and show time: {end_time - start_time:.2f} seconds")
