@@ -2,7 +2,6 @@ import cv2
 import time
 import os
 from . import zmq_msg
-import open3d as o3d
 import numpy as np
 import logging_mp
 logger_mp = logging_mp.get_logger(__name__, level=logging_mp.INFO)
