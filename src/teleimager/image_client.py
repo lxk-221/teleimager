@@ -151,10 +151,12 @@ def main():
                 #head_img, head_fps = client.get_head_frame()
                 head_img, head_depth_bytes, head_pointcloud_bytes = client.get_head_info()
                 if head_img is not None:
+                    start_time = time.time()
                     logger_mp.info(f"head_img shape: {head_img.shape}")
                     #logger_mp.info(f"Head Camera FPS: {head_fps:.2f}")
                     logger_mp.info(f"Head Camera Shape: {cam_config['head_camera']['image_shape']}")
-                    cv2.imshow("Head Camera", head_img)
+                    #cv2.imshow("Head Camera", head_img)
+                    cv2.imwrite(os.path.join(save_dir, f"head_img_frame_{frame_counter:06d}.jpg"), head_img)
                     
                     # 显示深度图
                     if head_depth_bytes is not None:
@@ -168,51 +170,14 @@ def main():
                         depth_vis = np.clip(depth_vis, 0, 10.0)
                         depth_vis = (depth_vis / 10.0 * 255).astype(np.uint8)
                         depth_colormap = cv2.applyColorMap(depth_vis, cv2.COLORMAP_JET)
-                        cv2.imshow("Head Depth", depth_colormap)
+                        #cv2.imshow("Head Depth", depth_colormap)
+                        cv2.imwrite(os.path.join(save_dir, f"depth_frame_{frame_counter:06d}.jpg"), depth_colormap)
                     
-                    # 处理点云数据（解码、可视化、保存）
                     if head_pointcloud_bytes is not None:
-                        # 使用decode_pointcloud方法解码（更优雅的官方方式）
-                        pc_decoded = client.decode_pointcloud(head_pointcloud_bytes)  # (H, W, 7) - XYZRGBA
-                        
-                        # 提取XYZ和RGB
-                        xyz = pc_decoded[:, :, :3].reshape(-1, 3)  # (H*W, 3)
-                        rgb = pc_decoded[:, :, 3:6].reshape(-1, 3)  # (H*W, 3)
-                        
-                        # 调试信息：检查原始数据
-                        total_points = len(xyz)
-                        nan_count = np.isnan(xyz).any(axis=1).sum()
-                        
-                        # 过滤无效点 (NaN或超出范围)
-                        valid_mask = ~np.isnan(xyz).any(axis=1)
-                        valid_mask &= (xyz[:, 2] > 0.3)  # 过滤距离<0.3m的点
-                        valid_mask &= (xyz[:, 2] < 10.0)  # 过滤距离>10m的点
-                        
-                        xyz_valid = xyz[valid_mask]
-                        rgb_valid = rgb[valid_mask]
-                        
-                    # 每N帧保存一次全部文件
-                    frame_counter += 1
-                    if save_interval > 0 and frame_counter % save_interval == 0:
-                        logger_mp.info(f"[Save] Frame {frame_counter}: Total={total_points}, NaN={nan_count}, Valid={len(xyz_valid)}")
-                        
-                        if len(xyz_valid) > 0:
-                            # 创建点云对象
-                            pcd_save = o3d.geometry.PointCloud()
-                            pcd_save.points = o3d.utility.Vector3dVector(xyz_valid)
-                            pcd_save.colors = o3d.utility.Vector3dVector(rgb_valid)
-                            
-                            # 保存为PLY文件
-                            save_path = os.path.join(save_dir, f"pointcloud_frame_{frame_counter:06d}.ply")
-                            o3d.io.write_point_cloud(save_path, pcd_save)
-                            logger_mp.info(f"[Save] Saved point cloud to: {save_path}")
-                            logger_mp.info(f"[Save] XYZ range: X=[{xyz_valid[:,0].min():.2f}, {xyz_valid[:,0].max():.2f}], "
-                                            f"Y=[{xyz_valid[:,1].min():.2f}, {xyz_valid[:,1].max():.2f}], "
-                                            f"Z=[{xyz_valid[:,2].min():.2f}, {xyz_valid[:,2].max():.2f}]")
-                            logger_mp.info(f"[Save] RGB range: R=[{rgb_valid[:,0].min():.3f}, {rgb_valid[:,0].max():.3f}], "
-                                            f"G=[{rgb_valid[:,1].min():.3f}, {rgb_valid[:,1].max():.3f}], "
-                                            f"B=[{rgb_valid[:,2].min():.3f}, {rgb_valid[:,2].max():.3f}]")
+                        np.save(os.path.join(save_dir, f"pointcloud_frame_{frame_counter:06d}.npy"), head_pointcloud_bytes)
 
+                    end_time = time.time()
+                    logger_mp.info(f"Head Camera Save and show time: {end_time - start_time:.2f} seconds")
         if "left_wrist_camera" in cam_config:
             if cam_config['left_wrist_camera']['enable_zmq']:
                 left_wrist_img, left_wrist_fps = client.get_left_wrist_frame()
@@ -239,6 +204,7 @@ def main():
                 vis.destroy_window()
                 logger_mp.info("[Image Client] Open3D visualizer closed")
         # Small delay to prevent excessive CPU usage
+        frame_counter += 1
         time.sleep(0.002)
 
 if __name__ == "__main__":
