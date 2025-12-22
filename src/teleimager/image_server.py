@@ -704,11 +704,100 @@ class ZedCamera(BaseCamera):
         self.zed.set_camera_settings(sl.VIDEO_SETTINGS.CONTRAST, 5)
         logger_mp.info(f"[ZedCamera] Camera settings: Brightness=5, Contrast=5")
 
+        # 3*3 camera intrinsics
+        # [ fx, 0, cx ],
+        # [ 0, fy, cy ],
+        # [ 0, 0, 1 ]
+        # 1*4 camera params [ fx, fy, cx, cy ]
+        # each variable is dict with key left and right
+        self._camera_intrinsics = {}
+        self._camera_params = {}
+        self._camera_distortion_coeffs = {}
+        self._camera_params = self._get_camera_intrinsics()
+        logger_mp.info(f"[ZedCamera] Camera intrinsics: {self._camera_intrinsics}")
+        logger_mp.info(f"[ZedCamera] Camera params: {self._camera_params}")
+        logger_mp.info(f"[ZedCamera] Camera distortion coeffs: {self._camera_distortion_coeffs}")
+        
         # 创建运行时参数
         self.runtime_params = sl.RuntimeParameters()
         
         logger_mp.info(str(self))
 
+    def _get_camera_intrinsics(self):
+        """
+        获取ZED左右眼相机内参
+        存储格式为字典，key为'left'和'right'
+        - self._camera_params: {'left': [fx, fy, cx, cy], 'right': [fx, fy, cx, cy]}
+        - self._camera_intrinsics: {'left': 3x3 matrix, 'right': 3x3 matrix}
+        - self._camera_distortion_coeffs: {'left': [...], 'right': [...]}
+        """
+        try:
+            calibration_params = self.zed.get_camera_information().camera_configuration.calibration_parameters
+            left_cam = calibration_params.left_cam
+            right_cam = calibration_params.right_cam
+            
+            # 左眼参数
+            # apriltag格式: [fx, fy, cx, cy]
+            self._camera_params['left'] = np.array([left_cam.fx, left_cam.fy, left_cam.cx, left_cam.cy], dtype=np.float32)
+            
+            # 3x3相机内参矩阵
+            self._camera_intrinsics['left'] = np.array([
+                [left_cam.fx, 0.0, left_cam.cx],
+                [0.0, left_cam.fy, left_cam.cy],
+                [0.0, 0.0, 1.0]
+            ], dtype=np.float32)
+            
+            # 畸变系数
+            self._camera_distortion_coeffs['left'] = np.array(left_cam.disto, dtype=np.float32)
+            
+            # 右眼参数
+            # apriltag格式: [fx, fy, cx, cy]
+            self._camera_params['right'] = np.array([right_cam.fx, right_cam.fy, right_cam.cx, right_cam.cy], dtype=np.float32)
+            
+            # 3x3相机内参矩阵
+            self._camera_intrinsics['right'] = np.array([
+                [right_cam.fx, 0.0, right_cam.cx],
+                [0.0, right_cam.fy, right_cam.cy],
+                [0.0, 0.0, 1.0]
+            ], dtype=np.float32)
+            
+            # 畸变系数
+            self._camera_distortion_coeffs['right'] = np.array(right_cam.disto, dtype=np.float32)
+            
+            logger_mp.info(f"[ZedCamera] Left camera intrinsics: fx={left_cam.fx:.2f}, fy={left_cam.fy:.2f}, "
+                          f"cx={left_cam.cx:.2f}, cy={left_cam.cy:.2f}")
+            logger_mp.info(f"[ZedCamera] Right camera intrinsics: fx={right_cam.fx:.2f}, fy={right_cam.fy:.2f}, "
+                          f"cx={right_cam.cx:.2f}, cy={right_cam.cy:.2f}")
+            
+            return self._camera_params
+        except Exception as e:
+            logger_mp.warning(f"[ZedCamera] Failed to get camera intrinsics: {e}")
+            return None
+    
+    def get_camera_params(self):
+        """
+        返回apriltag格式的相机参数
+        Returns:
+            dict: {'left': [fx, fy, cx, cy], 'right': [fx, fy, cx, cy]}
+        """
+        return self._camera_params
+    
+    def get_camera_matrix(self):
+        """
+        返回3x3相机内参矩阵
+        Returns:
+            dict: {'left': 3x3 matrix, 'right': 3x3 matrix}
+        """
+        return self._camera_intrinsics
+    
+    def get_distortion_coeffs(self):
+        """
+        返回畸变系数
+        Returns:
+            dict: {'left': [...], 'right': [...]}
+        """
+        return self._camera_distortion_coeffs
+    
     def __str__(self):
         return (
             f"[ZedCamera: {self._cam_topic}] initialized with "
@@ -916,12 +1005,39 @@ class ImageServer:
                     depth_port = cam_cfg.get("depth_port", None)
                     pointcloud_port = cam_cfg.get("pointcloud_port", None)
                     try:
-                        self._cameras[cam_topic] = ZedCamera(
+                        zed_camera = ZedCamera(
                             cam_topic, serial_number, img_shape, fps,
                             enable_zmq, zmq_port, enable_webrtc, webrtc_port,
                             enable_depth, enable_point_cloud,
                             depth_port, pointcloud_port
                         )
+                        self._cameras[cam_topic] = zed_camera
+                        
+                        # 将相机内参添加到cam_config中，以便client可以获取
+                        camera_params = zed_camera.get_camera_params()
+                        camera_matrix = zed_camera.get_camera_matrix()
+                        distortion_coeffs = zed_camera.get_distortion_coeffs()
+                        
+                        if camera_params is not None:
+                            # apriltag格式: {'left': [fx, fy, cx, cy], 'right': [fx, fy, cx, cy]}
+                            cam_cfg['camera_params'] = {
+                                'left': camera_params['left'].tolist(),
+                                'right': camera_params['right'].tolist()
+                            }
+                        if camera_matrix is not None:
+                            # 3x3相机矩阵: {'left': 3x3 matrix, 'right': 3x3 matrix}
+                            cam_cfg['camera_matrix'] = {
+                                'left': camera_matrix['left'].tolist(),
+                                'right': camera_matrix['right'].tolist()
+                            }
+                        if distortion_coeffs is not None:
+                            # 畸变系数: {'left': [...], 'right': [...]}
+                            cam_cfg['distortion_coeffs'] = {
+                                'left': distortion_coeffs['left'].tolist(),
+                                'right': distortion_coeffs['right'].tolist()
+                            }
+                            
+                        logger_mp.info(f"[Image Server] Added camera intrinsics (left & right) to config for {cam_topic}")
                     except Exception as e:
                         self._cameras[cam_topic] = None
                         logger_mp.error(f"[Image Server] Failed to initialize ZedCamera for {cam_topic}: {e}")
